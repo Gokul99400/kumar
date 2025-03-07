@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Magnetic Field AR</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+    <script>
+        let camera, scene, renderer, magSensor;
+        let measures = [];
+        let magneticBackground = new THREE.Vector3(0, 0, 0);
+
+        function setupMagSensor() {
+            if (!('Magnetometer' in window)) {
+                alert("Magnetometer API not supported on this device.");
+                return;
+            }
+
+            magSensor = new Magnetometer({ frequency: 10 });
+
+            magSensor.addEventListener('reading', () => {
+                if (measures.length > 800) {
+                    // Reset measurements
+                    measures = [];
+                    while (scene.children.length > 0) { scene.remove(scene.children[0]); }
+                    magneticBackground.set(0, 0, 0);
+                }
+
+                let localMeasure = new THREE.Vector3(magSensor.x, magSensor.y, magSensor.z);
+                let magField = localMeasure.applyQuaternion(camera.quaternion);
+
+                if (measures.length === 77) {
+                    // Calibrate for background magnetic field
+                    let sum = new THREE.Vector3(0, 0, 0);
+                    for (let i = 25; i <= 75; i++) { sum.add(measures[i]); }
+                    magneticBackground = sum.multiplyScalar(1 / 50);
+                }
+
+                magField.sub(magneticBackground);
+                measures.push(magField);
+
+                // Visualize as arrows
+                let magLength = magField.length() / 1000; 
+                let arrow = new THREE.ArrowHelper(magField.clone().normalize(), camera.position.clone(), magLength, 0xffff00);
+                scene.add(arrow);
+            });
+
+            magSensor.start();
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.001, 10);
+            camera.position.set(0, 0, 1);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function startAR() {
+            navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['local'] }).then(session => {
+                session.addEventListener('end', () => {
+                    renderer.xr.setSession(null);
+                    button.textContent = 'ENTER AR';
+                });
+
+                renderer.xr.setSession(session);
+                setupMagSensor();
+                button.textContent = 'EXIT AR';
+            }).catch(err => alert("AR Not Supported: " + err.message));
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(() => { renderer.render(scene, camera); });
+        }
+
+        init();
+        animate();
+
+        let button = document.createElement('button');
+        button.textContent = 'ENTER AR';
+        button.style.cssText = 'position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); padding: 10px;';
+        button.addEventListener('click', startAR);
+        document.body.appendChild(button);
+    </script>
+</body>
+</html>
