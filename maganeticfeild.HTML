@@ -4,63 +4,164 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Magnetic Field AR</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; }
+        #overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; /* Let touches pass through to 3D scene if needed */
+            display: flex; flex-direction: column; justify-content: flex-end; align-items: center;
+        }
+        #status {
+            background: rgba(0,0,0,0.5); color: white; padding: 10px; border-radius: 8px;
+            margin-bottom: 20px; text-align: center; pointer-events: auto;
+        }
+        button {
+            padding: 12px 24px; font-size: 16px; border: none; border-radius: 4px;
+            background: white; color: black; margin-bottom: 30px; pointer-events: auto;
+        }
+    </style>
+    <!-- Load Three.js -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 </head>
 <body>
+
+    <!-- UI Overlay for AR -->
+    <div id="overlay">
+        <div id="status">Ready to Enter AR</div>
+        <button id="ar-button">ENTER AR</button>
+    </div>
+
     <script>
         let camera, scene, renderer, magSensor;
-        let measures = [];
         let magneticBackground = new THREE.Vector3(0, 0, 0);
+        let calibrationSamples = [];
+        const CALIBRATION_COUNT = 50;
+        let isCalibrated = false;
 
-        function setupMagSensor() {
-            if (!('Magnetometer' in window)) {
-                alert("Magnetometer API not supported on this device.");
-                return;
-            }
-
-            magSensor = new Magnetometer({ frequency: 10 });
-
-            magSensor.addEventListener('reading', () => {
-                if (measures.length > 800) {
-                    // Reset measurements
-                    measures = [];
-                    while (scene.children.length > 0) { scene.remove(scene.children[0]); }
-                    magneticBackground.set(0, 0, 0);
-                }
-
-                let localMeasure = new THREE.Vector3(magSensor.x, magSensor.y, magSensor.z);
-                let magField = localMeasure.applyQuaternion(camera.quaternion);
-
-                if (measures.length === 77) {
-                    // Calibrate for background magnetic field
-                    let sum = new THREE.Vector3(0, 0, 0);
-                    for (let i = 25; i <= 75; i++) { sum.add(measures[i]); }
-                    magneticBackground = sum.multiplyScalar(1 / 50);
-                }
-
-                magField.sub(magneticBackground);
-                measures.push(magField);
-
-                // Visualize as arrows
-                let magLength = magField.length() / 1000; 
-                let arrow = new THREE.ArrowHelper(magField.clone().normalize(), camera.position.clone(), magLength, 0xffff00);
-                scene.add(arrow);
-            });
-
-            magSensor.start();
-        }
+        const statusDiv = document.getElementById('status');
+        const button = document.getElementById('ar-button');
 
         function init() {
             scene = new THREE.Scene();
-            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.001, 10);
-            camera.position.set(0, 0, 1);
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
             renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
             renderer.setPixelRatio(window.devicePixelRatio);
             renderer.setSize(window.innerWidth, window.innerHeight);
             renderer.xr.enabled = true;
             document.body.appendChild(renderer.domElement);
+
             window.addEventListener('resize', onWindowResize);
+            button.addEventListener('click', startAR);
+        }
+
+        function setupMagSensor() {
+            if (!('Magnetometer' in window)) {
+                statusDiv.textContent = "Magnetometer not supported on this device/browser.";
+                return;
+            }
+
+            // Request permissions first (Generic Sensor API requirement)
+            navigator.permissions.query({ name: 'magnetometer' }).then(result => {
+                if (result.state === 'denied') {
+                    statusDiv.textContent = "Magnetometer permission denied.";
+                    return;
+                }
+
+                try {
+                    magSensor = new Magnetometer({ frequency: 60 });
+                    magSensor.addEventListener('reading', onSensorReading);
+                    magSensor.addEventListener('error', (event) => {
+                        statusDiv.textContent = "Sensor Error: " + event.error.name;
+                    });
+                    magSensor.start();
+                    statusDiv.textContent = "Calibrating... Hold still.";
+                } catch (error) {
+                    statusDiv.textContent = "Sensor Init Error: " + error.message;
+                }
+            });
+        }
+
+        function onSensorReading() {
+            // raw sensor data (in uT)
+            let rawReading = new THREE.Vector3(magSensor.x, magSensor.y, magSensor.z);
+
+            // 1. CALIBRATION PHASE
+            // We average the first 50 frames to find the "Earth's Background Field"
+            if (!isCalibrated) {
+                calibrationSamples.push(rawReading);
+                if (calibrationSamples.length >= CALIBRATION_COUNT) {
+                    let sum = new THREE.Vector3(0, 0, 0);
+                    calibrationSamples.forEach(v => sum.add(v));
+                    magneticBackground = sum.divideScalar(calibrationSamples.length);
+                    isCalibrated = true;
+                    statusDiv.textContent = "Scanning... Move around magnets.";
+                }
+                return; // Don't draw arrows yet
+            }
+
+            // 2. VISUALIZATION PHASE
+            // Get vector relative to background
+            let anomaly = rawReading.clone().sub(magneticBackground);
+
+            // Only draw if the anomaly is significant (reduce noise)
+            if (anomaly.length() < 2) return; 
+
+            // Transform sensor coordinates to World Space
+            // Note: Sensor axes are fixed to device. We must apply camera rotation.
+            let worldVec = anomaly.clone().applyQuaternion(camera.quaternion);
+            
+            // Normalize for direction, use length for scaling
+            let len = worldVec.length();
+            let dir = worldVec.normalize();
+            
+            // Create visual arrow
+            // Scale down: 50uT is strong, make it 0.5 meters long
+            let arrowLength = Math.min(len * 0.01, 0.5); 
+            
+            // Color based on strength (Green = weak, Red = strong)
+            let color = new THREE.Color().setHSL(Math.max(0, 0.3 - (len * 0.005)), 1, 0.5);
+
+            let arrow = new THREE.ArrowHelper(dir, camera.position.clone(), arrowLength, color);
+            scene.add(arrow);
+
+            // Cleanup: Keep scene from crashing memory
+            if (scene.children.length > 300) {
+                scene.remove(scene.children[0]);
+            }
+        }
+
+        function startAR() {
+            if (!navigator.xr) {
+                alert("WebXR not available");
+                return;
+            }
+
+            // Request session with 'dom-overlay' so UI stays visible
+            navigator.xr.requestSession('immersive-ar', {
+                requiredFeatures: ['local'],
+                optionalFeatures: ['dom-overlay'],
+                domOverlay: { root: document.body } 
+            }).then(session => {
+                renderer.xr.setSession(session);
+                
+                session.addEventListener('end', () => {
+                    magSensor.stop();
+                    button.textContent = 'ENTER AR';
+                    statusDiv.textContent = 'Session Ended';
+                    isCalibrated = false;
+                    calibrationSamples = [];
+                    while(scene.children.length > 0){ 
+                        scene.remove(scene.children[0]); 
+                    }
+                });
+
+                button.textContent = 'EXIT AR';
+                setupMagSensor();
+            }).catch(err => {
+                alert("AR Error: " + err.message);
+            });
         }
 
         function onWindowResize() {
@@ -69,31 +170,14 @@
             renderer.setSize(window.innerWidth, window.innerHeight);
         }
 
-        function startAR() {
-            navigator.xr.requestSession('immersive-ar', { requiredFeatures: ['local'] }).then(session => {
-                session.addEventListener('end', () => {
-                    renderer.xr.setSession(null);
-                    button.textContent = 'ENTER AR';
-                });
-
-                renderer.xr.setSession(session);
-                setupMagSensor();
-                button.textContent = 'EXIT AR';
-            }).catch(err => alert("AR Not Supported: " + err.message));
-        }
-
         function animate() {
-            renderer.setAnimationLoop(() => { renderer.render(scene, camera); });
+            renderer.setAnimationLoop(() => {
+                renderer.render(scene, camera);
+            });
         }
 
         init();
         animate();
-
-        let button = document.createElement('button');
-        button.textContent = 'ENTER AR';
-        button.style.cssText = 'position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); padding: 10px;';
-        button.addEventListener('click', startAR);
-        document.body.appendChild(button);
     </script>
 </body>
 </html>
